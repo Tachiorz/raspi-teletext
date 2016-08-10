@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <getopt.h>
 
 #include "bcm_host.h"
 
@@ -52,6 +53,8 @@ VC_RECT_T image_rect;
 #define PITCH (ALIGN_UP(WIDTH, 32))
 #define ROW(n) (image+(PITCH*(n))+OFFSET)
 
+__uint16_t tv_lines_even = 0xFFFF;
+__uint16_t tv_lines_odd = 0xFFFF;
 
 void vsync(DISPMANX_UPDATE_HANDLE_T u, void* arg)
 {
@@ -73,10 +76,20 @@ void vsync(DISPMANX_UPDATE_HANDLE_T u, void* arg)
 
         // fill image
         int n;
-        for (n=0; n<HEIGHT; n+=2) {
-            get_packet(ROW(n)+24); // +24 because clock never changes
-            memcpy(ROW(n+1)+24, ROW(n)+24, 336); // double it up because the hardware scaler
-                                                 // will introduce blurring between lines
+        int l;
+        if(real_next_resource == 0) {
+            l = tv_lines_even;
+            for (n = 0; n < HEIGHT; n += 2) {
+                if (l & 1) get_packet(ROW(n) + 24); // +24 because clock never changes
+                l >>= 1;
+            }
+        }
+        else {
+            l = tv_lines_odd;
+            for (n=0; n<HEIGHT; n+=2) {
+                if (l&1) get_packet(ROW(n+1)+24);
+                l >>= 1;
+            }
         }
 
         // write to resource
@@ -96,6 +109,43 @@ int main(int argc, char *argv[])
 
     DISPMANX_UPDATE_HANDLE_T    update;
     uint32_t                    vc_image_ptr;
+    static int pipe_flag = 0;
+    printf("start");
+    while (1) {
+        int c;
+        int option_index = 0;
+        int tv_lines;
+        /*
+         *  ODD               EVEN
+         *  3333333333333333  0000000000000000 \
+         *  3333332222222222  2221111111111000 > line numbers
+         *  5432109876543210  3219876543210987 /
+         *
+         *  Example:
+         *  Used lines: even 7-13  odd 329-332
+         *  even 0000000001111111 = 0x007F
+         *  odd  0001110000000000 = 0x1C00
+         *  argument = 0x1C00007F = 469762175
+         */
+        static struct option long_options[] =
+                {
+                        /* These options set a flag. */
+                        {"pipe", no_argument, &pipe_flag, 1},
+                        /* These options don't set a flag.
+                           We distinguish them by their indices. */
+                        {"lines", required_argument, 0, 'l'},
+                        {0, 0, 0, 0}
+                };
+        c = getopt_long (argc, argv, "l:",
+                         long_options, &option_index);
+        if (c == -1)
+            break;
+        if (c == 'l' && optarg != NULL) {
+            sscanf(optarg, "%d", &tv_lines);
+            tv_lines_even = tv_lines & 0xFFFF;
+            tv_lines_odd = tv_lines >> 16;
+        }
+    }
 
     bcm_host_init();
 
@@ -104,11 +154,18 @@ int main(int argc, char *argv[])
     image = calloc( 1, PITCH * HEIGHT ); // buffer 0
     assert(image);
 
+    memset(image, 0, PITCH * HEIGHT);
+
     // initialize image buffer with clock run in
     int n, m, clock = 0x275555;
     for (m=0; m<24; m++) {
-        for (n=0; n<HEIGHT; n++) {
-            ROW(n)[m] = clock&1;
+        int even = tv_lines_even;
+        int odd = tv_lines_odd;
+        for (n=0; n<HEIGHT; n+=2) {
+            if (even&1) ROW(n)[m] = clock&1;
+            if (odd&1) ROW(n+1)[m] = clock&1;
+            even >>= 1;
+            odd >>= 1;
         }
         clock = clock >> 1;
     }
@@ -151,7 +208,7 @@ int main(int argc, char *argv[])
 
     vc_dispmanx_vsync_callback(display, vsync, NULL);
 
-    if (argc == 2 && argv[1][0] == '-') {
+    if (pipe_flag) {
         while(read_packets()) {
             ;
         }
